@@ -20,6 +20,7 @@ Paste and run the following four cells in your Kaggle notebook. These are optimi
 Clones the repository if it's a fresh session, or resets and pulls changes if the folder is already present. It also creates a symbolic link to the dataset.
 ```python
 import os
+import glob
 %cd /kaggle/working
 
 # Clone if folder doesn't exist; otherwise update it
@@ -35,9 +36,28 @@ else:
     %cd /kaggle/working
     print("Updating... Done!")
 
-# Ensure dataset symlink is created
-!ln -sf /kaggle/input/avigseg-usingforowncode/datasets /kaggle/working/avis-kaggle/datasets
-print("Dataset symlink... OK!")
+# Dynamically locate the directory containing train.json under the mounted input
+search_patterns = [
+    "/kaggle/input/avigseg-usingforowncode/train.json",
+    "/kaggle/input/avigseg-usingforowncode/*/train.json",
+    "/kaggle/input/avigseg-usingforowncode/*/*/train.json"
+]
+target_dir = None
+for pattern in search_patterns:
+    matches = glob.glob(pattern)
+    if matches:
+        target_dir = os.path.dirname(matches[0])
+        break
+
+if target_dir:
+    print(f"Found dataset directory at: {target_dir}")
+    # Remove existing link/directory if present
+    if os.path.exists("/kaggle/working/avis-kaggle/datasets") or os.path.islink("/kaggle/working/avis-kaggle/datasets"):
+        !rm -rf /kaggle/working/avis-kaggle/datasets
+    !ln -sf {target_dir} /kaggle/working/avis-kaggle/datasets
+    print("Dataset symlink... OK!")
+else:
+    print("ERROR: Could not find train.json under /kaggle/input/avigseg-usingforowncode/")
 ```
 
 ### 🔹 Cell 2: Install Dependencies
