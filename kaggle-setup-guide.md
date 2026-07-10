@@ -86,7 +86,7 @@ Launches the training process using both T4 GPUs. Once the training completes, t
 ```python
 %cd /kaggle/working/avis-kaggle
 print("Launching training...")
-!python train_net.py --num-gpus 2 --config-file configs/avism/Base-AVIS.yaml
+!python train_net.py --num-gpus 2 --config-file configs/avism/R50/avism_R50_IN.yaml
 ```
 
 ---
