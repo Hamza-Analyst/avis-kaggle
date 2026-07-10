@@ -68,8 +68,8 @@ print("Compiling CUDA Deformable Attention operators...")
 print("Compilation... Done!")
 ```
 
-### 🔹 Cell 4: Launch Training (Background Execution)
-Launches the training process using both T4 GPUs.
+### 🔹 Cell 4: Launch Training & Evaluation (Background Execution)
+Launches the training process using both T4 GPUs. Once the training completes, the script will automatically load the final model checkpoint and run the evaluation on `avis_test`, saving the results in `output/eval_results.txt`.
 ```python
 %cd /kaggle/working/avis-kaggle
 print("Launching training...")
@@ -80,12 +80,13 @@ print("Launching training...")
 
 ## 🚀 Running the Background Training (Recommended)
 
-Since the training run takes several hours, **do not run Cell 4 interactively** (as your browser session will time out and terminate the training).
+Since the training and evaluation runs take several hours, **do not run Cell 4 interactively** (as your browser session will time out and terminate the process).
 
-Follow these steps to run the training in the background:
-1. Paste all **4 cells** in the notebook.
+Follow these steps to run the process in the background:
+1. Paste all **4 cells** in the notebook. (There is no separate Cell 5 because evaluation is automatically executed at the end of the training script in Cell 4).
 2. In the top-right corner of the Kaggle notebook editor, click **`Save Version`**.
 3. Choose the **`Save & Run All (Commit)`** option.
 4. Click **`Save`**.
 5. Once the run starts, you can monitor the progress by clicking the three dots `...` next to the running version in the bottom-left corner and selecting **`Open Logs`**.
-6. You can safely close your browser window; Kaggle will run the training to completion on their servers and save all checkpoints and the final `eval_results.txt` file in the output directory.
+6. You can safely close your browser window; Kaggle will run the training and evaluation to completion on their servers and save all checkpoints and the final `eval_results.txt` file in the output directory.
+
