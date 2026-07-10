@@ -1,0 +1,16 @@
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+datasets/
+outputs/
+checkpoints/
+pre_models/
+*.pt
+*.pth
+*.pkl
