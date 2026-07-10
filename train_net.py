@@ -283,25 +283,26 @@ def main(args):
     train_res = trainer.train()
 
     # Run evaluation after training finishes
+    logger = logging.getLogger("avism")
     if comm.is_main_process():
-        logger = logging.getLogger("avism")
         logger.info("Running evaluation on the final model...")
 
-        # Configure config for evaluation only
-        cfg_eval = cfg.clone()
-        cfg_eval.defrost()
-        cfg_eval["eval_only"] = True
-        cfg_eval.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
-        cfg_eval.freeze()
+    # Configure config for evaluation only
+    cfg_eval = cfg.clone()
+    cfg_eval.defrost()
+    cfg_eval["eval_only"] = True
+    cfg_eval.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+    cfg_eval.freeze()
 
-        # Build model and load final weights
-        model = Trainer.build_model(cfg_eval)
-        DetectionCheckpointer(model, save_dir=cfg_eval.OUTPUT_DIR).resume_or_load(
-            cfg_eval.MODEL.WEIGHTS, resume=False
-        )
-        res = Trainer.test(cfg_eval, model)
+    # Build model and load final weights
+    model = Trainer.build_model(cfg_eval)
+    DetectionCheckpointer(model, save_dir=cfg_eval.OUTPUT_DIR).resume_or_load(
+        cfg_eval.MODEL.WEIGHTS, resume=False
+    )
+    res = Trainer.test(cfg_eval, model)
 
-        # Save results to a readable text file in the output directory
+    # Save results to a readable text file in the output directory
+    if comm.is_main_process():
         results_file = os.path.join(cfg.OUTPUT_DIR, "eval_results.txt")
         logger.info(f"Saving evaluation results to {results_file}...")
         with open(results_file, "w") as f:
