@@ -306,8 +306,16 @@ def main(args):
         logger.info(f"Saving evaluation results to {results_file}...")
         with open(results_file, "w") as f:
             f.write("=== AVISM Final Evaluation Results ===\n")
-            if isinstance(res, dict) and "segm" in res:
-                segm = res["segm"]
+            
+            # Unnest results if wrapped under the dataset name key
+            flat_res = res
+            if isinstance(res, dict) and len(res) == 1:
+                key = next(iter(res.keys()))
+                if key in cfg.DATASETS.TEST:
+                    flat_res = res[key]
+
+            if isinstance(flat_res, dict) and "segm" in flat_res:
+                segm = flat_res["segm"]
                 for metric, val in segm.items():
                     f.write(f"{metric}: {val}\n")
             else:
