@@ -14,7 +14,7 @@ Before running the notebook cells, make sure you configure your Kaggle notebook 
 
 ## 📓 Notebook Cells (Top to Bottom)
 
-Paste and run the following four cells in your Kaggle notebook.
+Paste and run the following four cells in your Kaggle notebook. These are optimized to hide verbose downloading/compiling progress bars to keep your background logs clean and easy to read.
 
 ### 🔹 Cell 1: Clone Repository and Link Dataset
 Clones the repository if it's a fresh session, or resets and pulls changes if the folder is already present. It also creates a symbolic link to the dataset.
@@ -24,46 +24,55 @@ import os
 
 # Clone if folder doesn't exist; otherwise update it
 if not os.path.exists("avis-kaggle"):
-    !git clone https://github.com/Hamza-Analyst/avis-kaggle.git
+    print("Cloning repository...")
+    !git clone -q https://github.com/Hamza-Analyst/avis-kaggle.git > /dev/null
+    print("Cloning... Done!")
 else:
+    print("Updating repository...")
     %cd avis-kaggle
-    !git reset --hard origin/main
-    !git pull
+    !git reset -q --hard origin/main > /dev/null
+    !git pull -q > /dev/null
     %cd /kaggle/working
+    print("Updating... Done!")
 
 # Ensure dataset symlink is created
 !ln -sf /kaggle/input/avigseg-usingforowncode/datasets /kaggle/working/avis-kaggle/datasets
+print("Dataset symlink... OK!")
 ```
 
 ### 🔹 Cell 2: Install Dependencies
-Upgrades `setuptools` to avoid `distutils` errors in Python 3.12, installs `detectron2` from source, and installs requirements from `requirements.txt`.
+Upgrades `setuptools` to avoid `distutils` errors in Python 3.12, installs `detectron2` from source, and installs requirements from `requirements.txt` quietly.
 ```python
+print("Installing dependencies...")
 %cd /kaggle/working/avis-kaggle
 
 # Upgrade setuptools to avoid distutils module error in Python 3.12
-!pip install -U setuptools
+!pip install -q -U setuptools > /dev/null
 
 # Install Detectron2 from official source
-!python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
+!python -m pip install -q 'git+https://github.com/facebookresearch/detectron2.git' > /dev/null
 
 # Install other requirements and compile helpers
-!pip install -r requirements.txt
-!pip install -U opencv-python ninja
+!pip install -q -r requirements.txt > /dev/null
+!pip install -q -U opencv-python ninja > /dev/null
+
+print("Installing dependencies... Done!")
 ```
 
 ### 🔹 Cell 3: Compile CUDA Deformable Attention Operators
-Compiles the custom CUDA operators for Deformable Attention using the target compute capability for Nvidia T4 GPUs (`7.5`).
+Compiles the custom CUDA operators for Deformable Attention quietly using the compute capability for Nvidia T4 GPUs (`7.5`).
 ```python
-# Compile the custom CUDA Operators
+print("Compiling CUDA Deformable Attention operators...")
 %cd /kaggle/working/avis-kaggle/mask2former/modeling/pixel_decoder/ops
-!export TORCH_CUDA_ARCH_LIST="7.5" && export CUDA_HOME=/usr/local/cuda && sh make.sh
+!export TORCH_CUDA_ARCH_LIST="7.5" && export CUDA_HOME=/usr/local/cuda && sh make.sh > /dev/null
+print("Compilation... Done!")
 ```
 
 ### 🔹 Cell 4: Launch Training (Background Execution)
 Launches the training process using both T4 GPUs.
 ```python
-# Run training with 2 GPUs using config
 %cd /kaggle/working/avis-kaggle
+print("Launching training...")
 !python train_net.py --num-gpus 2 --config-file configs/avism/Base-AVIS.yaml
 ```
 
