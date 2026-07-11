@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import re
 
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 from detectron2.config import get_cfg
 from detectron2.data.detection_utils import read_image
@@ -132,7 +132,7 @@ if __name__ == "__main__":
         audio_feats = np.load(audio_pth)
 
         start_time = time.time()
-        with autocast():
+        with autocast('cuda'):
             predictions, visualized_output = demo.run_on_video(vid_frames, audio_feats)
 
         os.makedirs(os.path.join(output_dir, video_name), exist_ok=True)

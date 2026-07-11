@@ -176,7 +176,7 @@ class Trainer(DefaultTrainer):
             dict: a dict of result metrics
         """
         if cfg["eval_only"]:
-            from torch.cuda.amp import autocast
+            from torch.amp import autocast
             logger = logging.getLogger(__name__)
             if isinstance(evaluators, DatasetEvaluator):
                 evaluators = [evaluators]
@@ -202,7 +202,7 @@ class Trainer(DefaultTrainer):
                         )
                         results[dataset_name] = {}
                         continue
-                with autocast():
+                with autocast('cuda'):
                     results_i = inference_on_dataset(model, data_loader, evaluator)
                 results[dataset_name] = results_i
 
