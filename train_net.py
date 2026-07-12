@@ -6,8 +6,6 @@ try:
 except:
     pass
 
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # RTX 4080 single GPU (changed from '0,1')
 
 import copy
 import itertools
