@@ -396,83 +396,98 @@ def setup(args):
 
 
 def main(args):
-    cfg = setup(args)
+    try:
+        cfg = setup(args)
 
-    if args.eval_only:
-        model = Trainer.build_model(cfg)
-        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=args.resume
-        )
-        res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            raise NotImplementedError
+        if args.eval_only:
+            model = Trainer.build_model(cfg)
+            DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+                cfg.MODEL.WEIGHTS, resume=args.resume
+            )
+            res = Trainer.test(cfg, model)
+            if cfg.TEST.AUG.ENABLED:
+                raise NotImplementedError
+            if comm.is_main_process():
+                verify_results(cfg, res)
+            return res
+
+        trainer = Trainer(cfg)
+        trainer.resume_or_load(resume=args.resume)
+        train_res = trainer.train()
+
+        # Run evaluation after training finishes
+        logger = logging.getLogger("avism")
         if comm.is_main_process():
-            verify_results(cfg, res)
-        return res
+            logger.info("Running evaluation on the final model...")
 
-    trainer = Trainer(cfg)
-    trainer.resume_or_load(resume=args.resume)
-    train_res = trainer.train()
+        # Configure config for evaluation only
+        cfg_eval = cfg.clone()
+        cfg_eval.defrost()
+        cfg_eval["eval_only"] = True
+        cfg_eval.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+        cfg_eval.freeze()
 
-    # Run evaluation after training finishes
-    logger = logging.getLogger("avism")
-    if comm.is_main_process():
-        logger.info("Running evaluation on the final model...")
+        # Build model and load final weights
+        model = Trainer.build_model(cfg_eval)
+        DetectionCheckpointer(model, save_dir=cfg_eval.OUTPUT_DIR).resume_or_load(
+            cfg_eval.MODEL.WEIGHTS, resume=False
+        )
+        res = Trainer.test(cfg_eval, model)
 
-    # Configure config for evaluation only
-    cfg_eval = cfg.clone()
-    cfg_eval.defrost()
-    cfg_eval["eval_only"] = True
-    cfg_eval.MODEL.WEIGHTS = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
-    cfg_eval.freeze()
+        # Save results to a readable text file in the output directory
+        if comm.is_main_process():
+            results_file = os.path.join(cfg.OUTPUT_DIR, "eval_results.txt")
+            logger.info(f"Saving evaluation results to {results_file}...")
+            
+            # Helper to format results
+            def write_results_to_file(path):
+                with open(path, "w") as f:
+                    f.write("=== AVISM Final Evaluation Results ===\n")
+                    flat_res = res
+                    if isinstance(res, dict) and len(res) == 1:
+                        key = next(iter(res.keys()))
+                        if key in cfg.DATASETS.TEST:
+                            flat_res = res[key]
 
-    # Build model and load final weights
-    model = Trainer.build_model(cfg_eval)
-    DetectionCheckpointer(model, save_dir=cfg_eval.OUTPUT_DIR).resume_or_load(
-        cfg_eval.MODEL.WEIGHTS, resume=False
-    )
-    res = Trainer.test(cfg_eval, model)
+                    if isinstance(flat_res, dict) and "segm" in flat_res:
+                        segm = flat_res["segm"]
+                        for metric, val in segm.items():
+                            f.write(f"{metric}: {val}\n")
+                    else:
+                        f.write(str(res))
 
-    # Save results to a readable text file in the output directory
-    if comm.is_main_process():
-        results_file = os.path.join(cfg.OUTPUT_DIR, "eval_results.txt")
-        logger.info(f"Saving evaluation results to {results_file}...")
-        
-        # Helper to format results
-        def write_results_to_file(path):
-            with open(path, "w") as f:
-                f.write("=== AVISM Final Evaluation Results ===\n")
-                flat_res = res
-                if isinstance(res, dict) and len(res) == 1:
-                    key = next(iter(res.keys()))
-                    if key in cfg.DATASETS.TEST:
-                        flat_res = res[key]
+            write_results_to_file(results_file)
+            print(f"Results saved to {results_file}")
 
-                if isinstance(flat_res, dict) and "segm" in flat_res:
-                    segm = flat_res["segm"]
-                    for metric, val in segm.items():
-                        f.write(f"{metric}: {val}\n")
-                else:
-                    f.write(str(res))
+            # Kaggle integration: copy weights and results to /kaggle/working
+            if os.path.exists("/kaggle/working"):
+                import shutil
+                # Copy weights
+                src_weights = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+                dst_weights = "/kaggle/working/model_final.pth"
+                if os.path.exists(src_weights):
+                    shutil.copy(src_weights, dst_weights)
+                    logger.info(f"Kaggle: Copied weights to {dst_weights}")
+                # Save results
+                kaggle_results_file = "/kaggle/working/results.txt"
+                write_results_to_file(kaggle_results_file)
+                logger.info(f"Kaggle: Saved results to {kaggle_results_file}")
 
-        write_results_to_file(results_file)
-        print(f"Results saved to {results_file}")
-
-        # Kaggle integration: copy weights and results to /kaggle/working
-        if os.path.exists("/kaggle/working"):
-            import shutil
-            # Copy weights
-            src_weights = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
-            dst_weights = "/kaggle/working/model_final.pth"
-            if os.path.exists(src_weights):
-                shutil.copy(src_weights, dst_weights)
-                logger.info(f"Kaggle: Copied weights to {dst_weights}")
-            # Save results
-            kaggle_results_file = "/kaggle/working/results.txt"
-            write_results_to_file(kaggle_results_file)
-            logger.info(f"Kaggle: Saved results to {kaggle_results_file}")
-
-    return train_res
+        return train_res
+    except BaseException as e:
+        import sys
+        import os
+        import signal
+        import traceback
+        # Log critical error info
+        sys.stderr.write(f"\n[CRITICAL ERROR] Process rank {comm.get_rank()} crashed!\n")
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        # Force-kill all processes in this session group to prevent NCCL hangs
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        except:
+            os._exit(1)
 
 
 if __name__ == "__main__":
