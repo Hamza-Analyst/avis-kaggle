@@ -28,8 +28,7 @@ DATASETS:
   TRAIN: ("avis_train",)
   TEST: ("avis_test", )
 SOLVER:
-  IMS_PER_BATCH: 1                  # 1 sample per step to prevent CUDA OOM during first stage decoder
-  GRADIENT_ACCUMULATION_STEPS: 2    # Accumulate over 2 steps to maintain effective batch size of 2
+  IMS_PER_BATCH: 2                  # Baseline batch size of 2 (1 per GPU on 2-GPU machine)
   BASE_LR: 0.0001                   # 1e-4 as per paper
   STEPS: (32000, 40000)              # LR drops by 0.1x at 32k and 40k iterations
   MAX_ITER: 48000                   # 48k total iterations (paper spec)
