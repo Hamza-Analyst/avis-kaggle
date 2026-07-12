@@ -26,6 +26,18 @@ from detectron2.engine import (
     default_setup,
     launch,
 )
+
+# Monkey patch detectron2's DDP wrapping to support find_unused_parameters=True
+import detectron2.engine.defaults as defaults
+import detectron2.engine as engine
+orig_create_ddp_model = defaults.create_ddp_model
+def custom_create_ddp_model(model, *, fp16_compression=False, **kwargs):
+    kwargs['find_unused_parameters'] = True
+    return orig_create_ddp_model(model, fp16_compression=fp16_compression, **kwargs)
+defaults.create_ddp_model = custom_create_ddp_model
+if hasattr(engine, "create_ddp_model"):
+    engine.create_ddp_model = custom_create_ddp_model
+
 from detectron2.evaluation import (
     DatasetEvaluator,
     inference_on_dataset,
