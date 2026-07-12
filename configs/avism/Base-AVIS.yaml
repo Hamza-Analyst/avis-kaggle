@@ -12,23 +12,32 @@ MODEL:
     STEM_OUT_CHANNELS: 64
     STRIDE_IN_1X1: False
     OUT_FEATURES: ["res2", "res3", "res4", "res5"]
+    NORM: "FrozenBN"
     # NORM: "SyncBN"
     RES5_MULTI_GRID: [1, 1, 1]  # not used
+  AVISM:
+    ENC_WINDOW_SIZE: 6
+    SIM_WEIGHT: 0.5
+    AUDIO_DIM: 128
+    USE_CCAF: False
+    AGCL_FRAME_WEIGHT: 0.0
+    AGCL_INSTANCE_WEIGHT: 0.0
+    AGCL_TEMPERATURE: 0.07
+    NUM_REGISTERS: 4
 DATASETS:
   TRAIN: ("avis_train",)
   TEST: ("avis_test", )
 SOLVER:
-  IMS_PER_BATCH: 2
-  BASE_LR: 0.0001
-  STEPS: (32000, )
-  MAX_ITER: 48000
-#  STEPS: (100, )
-#  MAX_ITER: 150
+  IMS_PER_BATCH: 1                  # 1 sample per step to prevent CUDA OOM during first stage decoder
+  GRADIENT_ACCUMULATION_STEPS: 2    # Accumulate over 2 steps to maintain effective batch size of 2
+  BASE_LR: 0.0001                   # 1e-4 as per paper
+  STEPS: (32000, 40000)              # LR drops by 0.1x at 32k and 40k iterations
+  MAX_ITER: 48000                   # 48k total iterations (paper spec)
   CHECKPOINT_PERIOD: 5000
   WARMUP_FACTOR: 1.0
   WARMUP_ITERS: 10
   WEIGHT_DECAY: 0.05
-  OPTIMIZER: "ADAMW"
+  OPTIMIZER: "ADAMW"                # AdamW as per paper
   BACKBONE_MULTIPLIER: 0.1
   CLIP_GRADIENTS:
     ENABLED: True
@@ -36,7 +45,7 @@ SOLVER:
     CLIP_VALUE: 0.01
     NORM_TYPE: 2.0
   AMP:
-    ENABLED: False
+    ENABLED: False                   # DISABLED to match baseline math and prevent accuracy gap
 INPUT:
   MIN_SIZE_TRAIN_SAMPLING: "choice_by_clip"
   RANDOM_FLIP: "flip_by_clip"

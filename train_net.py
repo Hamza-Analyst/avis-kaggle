@@ -7,7 +7,7 @@ except:
     pass
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # RTX 4080 single GPU (changed from '0,1')
 
 import copy
 import itertools
@@ -46,6 +46,24 @@ from avism import (
     build_detection_test_loader,
     add_avism_config,
 )
+
+
+def get_num_gt_instances(batched_inputs):
+    total_instances = 0
+    for video in batched_inputs:
+        instances = video.get("instances", [])
+        if not instances or len(instances) == 0:
+            continue
+        num_insts = len(instances[0])
+        if num_insts == 0:
+            continue
+        if not hasattr(instances[0], "gt_ids"):
+            continue
+        gt_ids_list = [inst.gt_ids for inst in instances]
+        gt_ids = torch.stack(gt_ids_list, dim=1) # [num_insts, num_frames]
+        valid_bool = (gt_ids != -1).any(dim=1)
+        total_instances += valid_bool.sum().item()
+    return total_instances
 
 
 class Trainer(DefaultTrainer):
@@ -161,22 +179,120 @@ class Trainer(DefaultTrainer):
             optimizer = maybe_add_gradient_clipping(cfg, optimizer)
         return optimizer
 
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.gradient_accumulation_steps = cfg.SOLVER.GRADIENT_ACCUMULATION_STEPS
+        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=cfg.SOLVER.AMP.ENABLED)
+        
+    def run_step(self):
+        """
+        Implement the standard training step logic with gradient accumulation and AMP.
+        """
+        if self.gradient_accumulation_steps <= 1:
+            super().run_step()
+            return
+        assert self.model.training, "[SimpleTrainer] model was changed to eval mode!"
+        assert torch.cuda.is_available(), "[SimpleTrainer] CUDA is required for the trainer!"
+        
+        from detectron2.utils.events import get_event_storage
+        from torch.cuda.amp import autocast
+        import time
+
+        start = time.perf_counter()
+        
+        # Ensure data loader iterator exists (D2 sometimes initializes it lazily or in train())
+        if not hasattr(self, "_data_loader_iter"):
+            self._data_loader_iter = iter(self.data_loader)
+
+        # 1. Pre-fetch all data batches for the accumulation cycle
+        batches = []
+        for accum_step in range(self.gradient_accumulation_steps):
+            try:
+                batches.append(next(self._data_loader_iter))
+            except StopIteration:
+                self._data_loader_iter = iter(self.data_loader)
+                batches.append(next(self._data_loader_iter))
+
+        # 2. Count the ground truth instances for each batch, and get the global total
+        local_gts = []
+        for batch in batches:
+            local_gts.append(max(get_num_gt_instances(batch), 1))
+        num_gt_total = sum(local_gts)
+
+        total_loss_dict = {}
+        
+        # Zero gradients only at the start of accumulation cycle
+        self.optimizer.zero_grad()
+        
+        for accum_step in range(self.gradient_accumulation_steps):
+            data = batches[accum_step]
+            data_time = time.perf_counter() - start
+
+            # Run forward pass with autocast
+            with autocast(enabled=self.grad_scaler.is_enabled()):
+                loss_dict = self.model(data)
+
+            if isinstance(loss_dict, torch.Tensor):
+                # If loss_dict is a single tensor, we scale it by steps
+                losses = loss_dict / self.gradient_accumulation_steps
+                loss_dict = {"total_loss": loss_dict}
+            else:
+                # Scaled losses for instance/mask losses vs classification/other losses
+                scaled_loss_terms = []
+                for k, v in loss_dict.items():
+                    if "mask" in k or "dice" in k:
+                        # Normalize mask/dice loss dynamically using N_local and N_total
+                        scaled_val = v * (local_gts[accum_step] / num_gt_total)
+                    else:
+                        # Standard scaling for other losses
+                        scaled_val = v / self.gradient_accumulation_steps
+                    scaled_loss_terms.append(scaled_val)
+                losses = sum(scaled_loss_terms)
+            
+            # Check for invalid loss
+            if not torch.isfinite(losses).all():
+                raise FloatingPointError(
+                    "Loss became infinite or NaN in accumulation step {}/{}!".format(
+                        accum_step + 1, self.gradient_accumulation_steps
+                    )
+                )
+
+            # Backward pass with GradScaler
+            self.grad_scaler.scale(losses).backward()
+            
+            # Aggregate metrics for logging
+            with torch.no_grad():
+                for k, v in loss_dict.items():
+                    if k not in total_loss_dict:
+                        total_loss_dict[k] = v.item() / self.gradient_accumulation_steps
+                    else:
+                        total_loss_dict[k] += v.item() / self.gradient_accumulation_steps
+                
+                # Track total loss
+                if "total_loss" not in total_loss_dict:
+                     total_loss_dict["total_loss"] = losses.item()
+                else:
+                     total_loss_dict["total_loss"] += losses.item()
+
+            start = time.perf_counter() # Reset start time for next data loading
+
+        # Optimizer step only after accumulation is done, scaled
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
+        
+        # Logging
+        storage = get_event_storage()
+        storage.put_scalars(data_time=data_time, **total_loss_dict)
+
+
     @classmethod
     def test(cls, cfg, model, evaluators=None):
         """
         Evaluate the given model. The given model is expected to already contain
         weights to evaluate.
-        Args:
-            cfg (CfgNode):
-            model (nn.Module):
-            evaluators (list[DatasetEvaluator] or None): if None, will call
-                :meth:`build_evaluator`. Otherwise, must have the same length as
-                ``cfg.DATASETS.TEST``.
-        Returns:
-            dict: a dict of result metrics
         """
         if cfg["eval_only"]:
-            from torch.amp import autocast
+            from torch.cuda.amp import autocast
             logger = logging.getLogger(__name__)
             if isinstance(evaluators, DatasetEvaluator):
                 evaluators = [evaluators]
@@ -188,8 +304,6 @@ class Trainer(DefaultTrainer):
             results = OrderedDict()
             for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
                 data_loader = cls.build_test_loader(cfg, dataset_name)
-                # When evaluators are passed in as arguments,
-                # implicitly assume that evaluators can be created before data_loader.
                 if evaluators is not None:
                     evaluator = evaluators[idx]
                 else:
@@ -202,7 +316,7 @@ class Trainer(DefaultTrainer):
                         )
                         results[dataset_name] = {}
                         continue
-                with autocast('cuda'):
+                with autocast():
                     results_i = inference_on_dataset(model, data_loader, evaluator)
                 results[dataset_name] = results_i
 
@@ -238,6 +352,14 @@ class Trainer(DefaultTrainer):
                                                                                results_i['segm']['FAs'],
                                                                                results_i['segm']['FAm']))
 
+                if 'J&F' in results_i['segm']:
+                    print("J&F: {} || J-Mean: {} || J-Recall: {} || F-Mean: {} || F-Recall: {}".format(
+                        results_i['segm']['J&F'],
+                        results_i['segm']['J-Mean'],
+                        results_i['segm']['J-Recall'],
+                        results_i['segm']['F-Mean'],
+                        results_i['segm']['F-Recall']))
+
             if len(results) == 1:
                 results = list(results.values())[0]
             return results
@@ -258,7 +380,7 @@ def setup(args):
     cfg["eval_only"] = args.eval_only
     cfg.freeze()
     default_setup(cfg, args)
-    # Setup logger for "mask_former" module
+    # Setup logger for "avism" module
     setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="avism")
     return cfg
 
@@ -324,7 +446,6 @@ def main(args):
         print(f"Results saved to {results_file}")
 
     return train_res
-
 
 
 if __name__ == "__main__":

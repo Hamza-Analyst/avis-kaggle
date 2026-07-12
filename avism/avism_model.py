@@ -170,6 +170,16 @@ class AVISM(nn.Module):
         if sim_weight > 0.0:
             avism_weight_dict["loss_avism_sim"] = sim_weight
 
+        # AGCL: frame-level contrastive loss
+        agcl_frame_weight = cfg.MODEL.AVISM.AGCL_FRAME_WEIGHT
+        if agcl_frame_weight > 0.0:
+            avism_weight_dict["loss_agcl_frame"] = agcl_frame_weight
+
+        # AGCL: instance-level contrastive loss
+        agcl_instance_weight = cfg.MODEL.AVISM.AGCL_INSTANCE_WEIGHT
+        if agcl_instance_weight > 0.0:
+            avism_weight_dict["loss_agcl_instance"] = agcl_instance_weight
+
         if avism_deep_supervision:
             avism_dec_layers = cfg.MODEL.AVISM.DEC_LAYERS
             aux_weight_dict = {}
@@ -179,6 +189,13 @@ class AVISM(nn.Module):
         avism_losses = ["avism_labels", "avism_masks"]
         if sim_weight > 0.0:
             avism_losses.append("fg_sim")
+        if agcl_frame_weight > 0.0:
+            avism_losses.append("agcl_frame")
+        if agcl_instance_weight > 0.0:
+            avism_losses.append("agcl_instance")
+        if cfg.MODEL.AVISM.CALIB_HEAD_ON:
+            avism_weight_dict["loss_calib"] = cfg.MODEL.AVISM.CALIB_WEIGHT
+            avism_losses.append("calib")
 
         avism_criterion = AvismSetCriterion(
             num_classes,
@@ -190,6 +207,8 @@ class AVISM(nn.Module):
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             sim_use_clip=cfg.MODEL.AVISM.SIM_USE_CLIP,
+            agcl_temperature=cfg.MODEL.AVISM.AGCL_TEMPERATURE,
+            calib_hard_weight=cfg.MODEL.AVISM.CALIB_HARD_WEIGHT if cfg.MODEL.AVISM.CALIB_HEAD_ON else 3.0,
         )
 
         return {
@@ -284,9 +303,14 @@ class AVISM(nn.Module):
         losses, fg_indices = self.criterion(outputs, frame_targets)
 
         avism_outputs = self.avism_module(frame_queries, audio_features)
-        avism_outputs["pred_masks"] = torch.einsum("lbqc,btchw->lbqthw", avism_outputs["pred_mask_embed"], mask_features)
+        avism_outputs["mask_features"] = mask_features
+        avism_outputs["stage1_outputs"] = outputs
         for out in avism_outputs["aux_outputs"]:
-            out["pred_masks"] = torch.einsum("lbqc,btchw->lbqthw", out["pred_mask_embed"], mask_features)
+            out["mask_features"] = mask_features
+
+        # Pass projected audio features for AGCL contrastive loss
+        audio_proj_for_agcl = self.sem_seg_head.predictor.av_pre_proj(audio_features)
+        avism_outputs["audio_feats_proj"] = audio_proj_for_agcl.view(B, T, -1)  # [B, T, C]
 
         for k in list(losses.keys()):
             if k in self.criterion.weight_dict:
@@ -448,7 +472,7 @@ class AVISM(nn.Module):
         indices = torch.nonzero(scores_per_video > confidence).squeeze(-1)
         scores_per_video = scores_per_video[indices]
         labels_per_video = labels_per_video[indices]
-        masks_per_video = masks_per_video[indices]
+        masks_per_video = masks_per_video[indices.cpu()]
 
         processed_results = {
             "image_size": (out_height, out_width),

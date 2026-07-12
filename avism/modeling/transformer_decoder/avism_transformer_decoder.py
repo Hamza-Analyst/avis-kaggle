@@ -11,6 +11,9 @@ from detectron2.layers import Conv2d
 
 from .position_encoding import PositionEmbeddingSine
 from mask2former.modeling.transformer_decoder.maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
+from .cbam import CBAM2D
+
+
 
 
 class SelfAttentionLayer(nn.Module):
@@ -254,6 +257,14 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
+        for k in list(state_dict.keys()):
+            if k.startswith(prefix):
+                suffix = k[len(prefix):]
+                if "calib_gamma" in suffix:
+                    new_key = k.replace("calib_gamma", "gamma")
+                    state_dict[new_key] = state_dict[k]
+                    del state_dict[k]
+
         version = local_metadata.get("version", None)
         if version is None or version < 2:
             # Do not warn if train from scratch
@@ -290,6 +301,10 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         mask_dim: int,
         enforce_input_project: bool,
         avism_last_layer_num: int,
+        use_ccaf: bool = False,
+        num_frames: int = 5,
+        audio_dim: int = 128,
+        calib_head_on: bool = True,
     ):
         """
         NOTE: this interface is experimental.
@@ -317,12 +332,34 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-        self.av_pre_proj = nn.Linear(128, hidden_dim)
+        # Audio projection: dynamically sized based on audio_dim
+        self.av_pre_proj = nn.Linear(audio_dim, hidden_dim)
         self.av_sf = nn.ModuleList()
         for _ in range(3):
             self.av_sf.append(
                 CrossAttentionLayer(d_model=hidden_dim, nhead=nheads, dropout=0.0, normalize_before=pre_norm))
         self.av_post_proj = nn.Linear(hidden_dim * 3, hidden_dim)
+
+        self.cbams = nn.ModuleList([CBAM2D(hidden_dim) for _ in range(3)])
+        self.cbam_alphas = nn.Parameter(torch.zeros(3))
+
+
+
+        # CCAF: Causal Cross-Attention Fusion (SeaVIS)
+        self.use_ccaf = use_ccaf
+        self.num_frames = num_frames
+        if use_ccaf:
+            self.ccaf_cross_attns = nn.ModuleList([
+                nn.MultiheadAttention(hidden_dim, nheads, dropout=0.0)
+                for _ in range(3)
+            ])
+            self.ccaf_norms = nn.ModuleList([
+                nn.LayerNorm(hidden_dim) for _ in range(3)
+            ])
+            self.ccaf_audio_pos = nn.Embedding(50, hidden_dim)  # max 50 frames
+            # Audio energy gate: learns to suppress audio injection in silent frames
+            self.audio_gate = nn.Linear(hidden_dim, 1)
+            nn.init.constant_(self.audio_gate.bias, 0.0)  # start neutral (sigmoid(0)=0.5)
 
         # define Transformer decoder here
         self.num_heads = nheads
@@ -363,12 +400,9 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
-        # learnable query features
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
-        # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
-        # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         self.input_proj = nn.ModuleList()
@@ -379,12 +413,18 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
             else:
                 self.input_proj.append(nn.Sequential())
 
-        # output FFNs
         if self.mask_classification:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
         self.avism_last_layer_num = avism_last_layer_num
+
+        self.calib_head_on = calib_head_on
+        self.num_classes = num_classes
+        if self.calib_head_on:
+            self.calib_mlp = MLP(hidden_dim, 64, 1, 2)
+            self.gamma = nn.Parameter(torch.tensor(0.5))
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -411,6 +451,10 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
 
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["avism_last_layer_num"] = cfg.MODEL.AVISM.LAST_LAYER_NUM
+        ret["use_ccaf"] = cfg.MODEL.AVISM.USE_CCAF
+        ret["num_frames"] = cfg.INPUT.SAMPLING_FRAME_NUM
+        ret["audio_dim"] = cfg.MODEL.AVISM.AUDIO_DIM
+        ret["calib_head_on"] = cfg.MODEL.AVISM.CALIB_HEAD_ON
 
         return ret
 
@@ -424,14 +468,19 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         # disable mask, it does not affect performance
         del mask
 
+        audio_proj = self.av_pre_proj(audio_features) # [B, 256]
+
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
-            pos.append(self.pe_layer(x[i], None).flatten(2))
-            src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            src_i = self.input_proj[i](x[i])
 
-            # flatten NxCxHxW to HWxNxC
-            pos[-1] = pos[-1].permute(2, 0, 1)
-            src[-1] = src[-1].permute(2, 0, 1)
+            # Zero-Initialized CBAM Residual
+            src_i = src_i + self.cbam_alphas[i] * self.cbams[i](src_i)
+
+            pos_i = self.pe_layer(x[i], None).flatten(2).permute(2, 0, 1)
+            src_i_flat = src_i.flatten(2) + self.level_embed.weight[i][None, :, None]
+            pos.append(pos_i)
+            src.append(src_i_flat.permute(2, 0, 1))
 
         _, bs, _ = src[0].shape
 
@@ -442,21 +491,51 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         frame_queries = []
         predictions_class = []
         predictions_mask = []
+        predictions_calib_logits = []
 
-        # frame-level audio-visual spatial fusion
-        audio_feat = self.av_pre_proj(audio_features)
-        audio_feat = audio_feat[None, :, :]
-        av_feats = []
-        for l in range(len(src)):
-            av_feat = self.av_sf[l](audio_feat, src[l], query_pos=query_embed)
-            av_feats.append(av_feat)
-        audio_feats_ml = self.av_post_proj(torch.cat((av_feats[0], av_feats[1], av_feats[2]), dim=-1))
-        output = output + audio_feats_ml
+        if self.use_ccaf:
+            # CCAF: visual features attend to temporal audio history
+            BT = audio_proj.shape[0]
+            T = self.num_frames if self.training else BT
+            B_clip = BT // T
+            C = audio_proj.shape[-1]
+            # Audio KV: [BT, C] → [T, B, C]
+            audio_kv = audio_proj.view(B_clip, T, C).permute(1, 0, 2)
+            audio_pos = self.ccaf_audio_pos.weight[:T].unsqueeze(1)
+            audio_kv_pos = audio_kv + audio_pos
+            for i in range(self.num_feature_levels):
+                s = src[i]  # [HW, BT, C]
+                HW = s.shape[0]
+                # Reshape: [HW, BT, C] → [T*HW, B, C]
+                s_r = s.view(HW, B_clip, T, C).permute(2, 0, 1, 3).reshape(T * HW, B_clip, C)
+                # Causal mask: True = blocked (can't attend to future audio)
+                vis_t = torch.arange(T * HW, device=s.device) // HW
+                aud_t = torch.arange(T, device=s.device)
+                cmask = vis_t.unsqueeze(1) < aud_t.unsqueeze(0)  # [T*HW, T]
+                attn_out, _ = self.ccaf_cross_attns[i](
+                    query=s_r, key=audio_kv_pos, value=audio_kv, attn_mask=cmask)
+                s_r = self.ccaf_norms[i](s_r + attn_out)
+                src[i] = s_r.view(T, HW, B_clip, C).permute(1, 2, 0, 3).reshape(HW, BT, C)
+            # Simple audio injection into queries (SeaVIS style)
+            # Gated audio injection: learned gate suppresses audio in silent frames
+            gate = torch.sigmoid(self.audio_gate(audio_proj))  # [BT, 1]
+            gated_audio = gate * audio_proj  # [BT, C]
+            output = output + gated_audio[None, :, :].expand(self.num_queries, -1, -1)
+        else:
+            # Legacy: frame-level audio-visual spatial fusion
+            audio_feat = audio_proj[None, :, :]
+            av_feats = []
+            for l in range(len(src)):
+                av_feat = self.av_sf[l](audio_feat, src[l], query_pos=query_embed)
+                av_feats.append(av_feat)
+            audio_feats_ml = self.av_post_proj(torch.cat((av_feats[0], av_feats[1], av_feats[2]), dim=-1))
+            output = output + audio_feats_ml
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask, frame_query = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
+        outputs_class, outputs_mask, attn_mask, frame_query, calib_logits = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        predictions_calib_logits.append(calib_logits)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -480,10 +559,11 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask, frame_query = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
+            outputs_class, outputs_mask, attn_mask, frame_query, calib_logits = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
             frame_queries.append(frame_query)
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_calib_logits.append(calib_logits)
 
         assert len(predictions_class) == self.num_layers + 1
 
@@ -491,9 +571,13 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
+                predictions_class if self.mask_classification else None, predictions_mask,
+                predictions_calib_logits if self.calib_head_on else None
             )
         }
+        if self.calib_head_on:
+            out['pred_calib_logits'] = predictions_calib_logits[-1]
+
 
         num_layer         = self.avism_last_layer_num if self.training else 1
         frame_queries     = torch.stack(frame_queries[-num_layer:]) # L x BT x fQ x 256
@@ -507,6 +591,14 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         mask_embed = self.mask_embed(decoder_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
+        calib_logits = None
+        if self.calib_head_on:
+            calib_logits = self.calib_mlp(decoder_output) # [BT, fQ, 1]
+            r = torch.sigmoid(calib_logits)
+            outputs_class = outputs_class.clone()
+            gamma_positive = torch.abs(self.gamma)
+            outputs_class[..., self.num_classes] += gamma_positive * (1.0 - r.squeeze(-1))
+
         # NOTE: prediction is of higher-resolution
         # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
         attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
@@ -515,17 +607,24 @@ class AVISMMultiScaleMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask, decoder_output
+        return outputs_class, outputs_mask, attn_mask, decoder_output, calib_logits
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_calib_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
-            return [
-                {"pred_logits": a, "pred_masks": b}
-                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
-            ]
+            if outputs_calib_logits is not None:
+                return [
+                    {"pred_logits": a, "pred_masks": b, "pred_calib_logits": c}
+                    for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_calib_logits[:-1])
+                ]
+            else:
+                return [
+                    {"pred_logits": a, "pred_masks": b}
+                    for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                ]
         else:
             return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+

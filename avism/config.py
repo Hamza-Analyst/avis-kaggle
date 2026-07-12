@@ -3,6 +3,7 @@ from detectron2.config import CfgNode as CN
 
 
 def add_avism_config(cfg):
+    cfg.SOLVER.GRADIENT_ACCUMULATION_STEPS = 1
     cfg.DATASETS.DATASET_RATIO = []
 
     # DataLoader
@@ -50,7 +51,26 @@ def add_avism_config(cfg):
 
     cfg.MODEL.AVISM.SIM_USE_CLIP = True
     cfg.MODEL.AVISM.SIM_WEIGHT = 0.5
+    cfg.MODEL.AVISM.NUM_REGISTERS = 4
+
+    # CCAF: Causal Cross-Attention Fusion (SeaVIS)
+    cfg.MODEL.AVISM.USE_CCAF = False
+
+    # AGCL: Audio-Guided Contrastive Learning (SeaVIS)
+    # Asymmetric: frame=0.75 drives FSLA, instance=0.5 stabilizes AP/HOTA
+    cfg.MODEL.AVISM.AGCL_FRAME_WEIGHT = 0.0
+    cfg.MODEL.AVISM.AGCL_INSTANCE_WEIGHT = 0.0
+    cfg.MODEL.AVISM.AGCL_TEMPERATURE = 0.07
+
+    # Audio dimension (128 for VGGish, 768 for BEATs)
+    cfg.MODEL.AVISM.AUDIO_DIM = 128
 
     cfg.MODEL.AVISM.FREEZE_DETECTOR = False
     cfg.MODEL.AVISM.TEST_RUN_CHUNK_SIZE = 18
     cfg.MODEL.AVISM.TEST_INTERPOLATE_CHUNK_SIZE = 5
+
+    # Sounding-State Calibration Head (Module A)
+    cfg.MODEL.AVISM.CALIB_HEAD_ON = True
+    cfg.MODEL.AVISM.CALIB_WEIGHT = 1.0
+    cfg.MODEL.AVISM.CALIB_HARD_WEIGHT = 3.0
+

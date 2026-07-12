@@ -88,7 +88,8 @@ class AvismSetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio, sim_use_clip):
+                 num_points, oversample_ratio, importance_sample_ratio, sim_use_clip,
+                 agcl_temperature=0.07, calib_hard_weight=3.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -112,6 +113,150 @@ class AvismSetCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
         self.sim_use_clip = sim_use_clip
+
+        # AGCL: Audio-Guided Contrastive Learning (SeaVIS-inspired)
+        self.agcl_temperature = agcl_temperature
+        hidden_dim = 256  # Must match HIDDEN_DIM
+        self.audio_anchor_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.calib_hard_weight = calib_hard_weight
+
+    def loss_frame_contrastive(self, outputs, clip_targets, frame_targets,
+                                clip_indices, frame_indices, num_masks):
+        """
+        Frame-Level Audio-Guided Contrastive Loss (SeaVIS Eq. 3-4).
+        """
+        src_fq = outputs.get("pred_fq_embed")  # [L, B, T, fQ, C]
+        if src_fq is None:
+            return {"loss_agcl_frame": torch.tensor(0.0, device=next(iter(outputs.values())).device)}
+        
+        L, B, T, fQ, C = src_fq.shape
+        BT = B * T
+        
+        # Get audio features (already projected to hidden_dim by the decoders)
+        audio_feats = outputs.get("audio_feats_proj")  # [B*T, C] or [B, T, C]
+        if audio_feats is None:
+            return {"loss_agcl_frame": torch.tensor(0.0, device=src_fq.device)}
+        
+        # Project audio to anchor space and normalize
+        audio_anchors = self.audio_anchor_proj(audio_feats)  # [B*T, C]
+        if audio_anchors.dim() == 2:
+            audio_anchors = audio_anchors.view(B, T, C)
+        audio_anchors = F.normalize(audio_anchors, dim=-1)   # [B, T, C]
+        
+        # Use only the last decoder layer's embeddings (most refined)
+        fq = src_fq[-1]  # [B, T, fQ, C]
+        
+        # Flatten frame indices (they come grouped by decoder layer)
+        flat_frame_indices = frame_indices[-1] if isinstance(frame_indices[0], list) else frame_indices
+        
+        # Flatten B & T dimensions for vectorization
+        fq_flat = fq.view(BT, fQ, C)  # [BT, fQ, C]
+        fq_norm = F.normalize(fq_flat, dim=-1)  # [BT, fQ, C]
+        
+        audio_anchors_flat = audio_anchors.view(BT, C)  # [BT, C]
+        
+        # Compute all similarities in one GPU batch matrix multiplication
+        # [BT, fQ, C] @ [BT, C, 1] -> [BT, fQ, 1] -> [BT, fQ]
+        all_sims = torch.bmm(fq_norm, audio_anchors_flat.unsqueeze(-1)).squeeze(-1) / self.agcl_temperature
+        
+        # Build positive mask
+        pos_mask = torch.zeros((BT, fQ), dtype=torch.bool, device=fq.device)
+        for i in range(BT):
+            if i < len(flat_frame_indices):
+                matched_src, _ = flat_frame_indices[i]
+                if len(matched_src) > 0:
+                    pos_mask[i, matched_src] = True
+        
+        num_valid_pairs = pos_mask.sum().item()
+        if num_valid_pairs == 0:
+            return {"loss_agcl_frame": torch.tensor(0.0, device=fq.device)}
+            
+        # Numerical stability: subtract max per frame
+        max_sims, _ = all_sims.max(dim=-1, keepdim=True)  # [BT, 1]
+        exp_sims = torch.exp(all_sims - max_sims)  # [BT, fQ]
+        
+        sum_all_exp = exp_sims.sum(dim=-1, keepdim=True)  # [BT, 1]
+        sum_pos_exp = (exp_sims * pos_mask).sum(dim=-1, keepdim=True)  # [BT, 1]
+        sum_neg_exp = sum_all_exp - sum_pos_exp  # [BT, 1]
+        
+        # Log-Sum-Exp denominator for each positive entry
+        denom = exp_sims + sum_neg_exp  # [BT, fQ]
+        loss_all = torch.log(denom) - (all_sims - max_sims)  # [BT, fQ]
+        
+        # Compute InfoNCE only over positive entries
+        total_loss = loss_all[pos_mask].sum() / num_valid_pairs
+        
+        return {"loss_agcl_frame": total_loss}
+
+    def loss_instance_contrastive(self, outputs, clip_targets, frame_targets,
+                                   clip_indices, frame_indices, num_masks):
+        """
+        Instance-Level Audio-Guided Contrastive Loss (SeaVIS Eq. 5-6).
+        """
+        src_cq = outputs.get("pred_cq_embed")  # [L, B, cQ, C]
+        audio_feats = outputs.get("audio_feats_proj")  # [B*T, C] or [B, T, C]
+        
+        if src_cq is None or audio_feats is None:
+            dev = next(iter(outputs.values())).device
+            return {"loss_agcl_instance": torch.tensor(0.0, device=dev)}
+        
+        L, B, cQ, C = src_cq.shape
+        cq = src_cq[-1]  # [B, cQ, C] - last decoder layer
+        
+        if audio_feats.dim() == 2:
+            BT = audio_feats.shape[0]
+            T = BT // B
+            audio_feats = audio_feats.view(B, T, C)
+        else:
+            T = audio_feats.shape[1]
+            
+        audio_anchors = self.audio_anchor_proj(
+            audio_feats.reshape(B * T, C)
+        ).view(B, T, C)  # [B, T, C]
+        
+        losses = []
+        
+        for b in range(B):
+            matched_src, matched_tgt = clip_indices[b]
+            if len(matched_src) == 0:
+                continue
+                
+            # Pre-normalize clip queries for this batch element
+            cq_b = F.normalize(cq[b, matched_src], dim=-1)  # [M, C]
+            
+            # Target IDs for matched instances
+            ids_all = clip_targets[b]["ids"][matched_tgt]  # [M, T]
+            
+            sounding_mask = ids_all != -1  # [M, T]
+            silent_mask = ids_all == -1    # [M, T]
+            
+            # Loop over matched instances in this batch element
+            for i, (sounding, silent) in enumerate(zip(sounding_mask, silent_mask)):
+                if not sounding.any() or not silent.any():
+                    continue
+                    
+                # Sounding audio anchor
+                sounding_audio = audio_anchors[b, sounding]  # [N_sound, C]
+                anchor = F.normalize(sounding_audio.mean(0), dim=-1)  # [C]
+                
+                pos_sim = (cq_b[i] @ anchor) / self.agcl_temperature
+                
+                # Negatives: audio from silent frames
+                silent_audio = audio_anchors[b, silent]  # [N_silent, C]
+                silent_audio_norm = F.normalize(silent_audio, dim=-1)
+                neg_sims = (silent_audio_norm @ cq_b[i]) / self.agcl_temperature  # [N_silent]
+                
+                logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])
+                target = torch.zeros(1, dtype=torch.long, device=logits.device)
+                losses.append(F.cross_entropy(logits.unsqueeze(0), target))
+                
+        if len(losses) > 0:
+            total_loss = torch.stack(losses).mean()
+        else:
+            total_loss = torch.tensor(0.0, device=cq.device)
+            
+        return {"loss_agcl_instance": total_loss}
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -138,6 +283,8 @@ class AvismSetCriterion(nn.Module):
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
+        if "pred_masks" not in outputs and "mask_features" in outputs:
+            outputs["pred_masks"] = torch.einsum("lbqc,btchw->lbqthw", outputs["pred_mask_embed"], outputs["mask_features"])
         assert "pred_masks" in outputs
 
         idx = self._get_src_permutation_idx(indices)
@@ -184,6 +331,8 @@ class AvismSetCriterion(nn.Module):
 
         del src_masks
         del target_masks
+        if "mask_features" in outputs and "pred_masks" in outputs:
+            del outputs["pred_masks"]
         return losses
 
     def loss_fg_sim(
@@ -258,6 +407,48 @@ class AvismSetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_calibration(self, outputs, clip_targets, frame_targets, clip_indices, frame_indices, num_masks):
+        stage1_outputs = outputs.get("stage1_outputs")
+        if stage1_outputs is None or "pred_calib_logits" not in stage1_outputs:
+            return {"loss_calib": torch.tensor(0.0, device=next(iter(outputs.values())).device)}
+
+        r_final = stage1_outputs["pred_calib_logits"] # [BT, fQ, 1]
+        BT, fQ, _ = r_final.shape
+        B = len(clip_targets)
+        T = BT // B
+
+        device = r_final.device
+        y = torch.zeros((B, T, fQ), dtype=torch.float32, device=device)
+
+        for b in range(B):
+            src_idx, tgt_idx = clip_indices[b]
+            ids = clip_targets[b]["ids"] # [N_gt, T]
+            for q, J in zip(src_idx, tgt_idx):
+                for t in range(T):
+                    gt_id = ids[J, t].item()
+                    if gt_id != -1:
+                        y[b, t, q] = 1.0
+                    else:
+                        y[b, t, q] = 0.0
+
+        y = y.view(BT, fQ)
+        r_final_sq = r_final.squeeze(-1)
+
+        pos_weight = torch.tensor([15.0]).to(device)
+        loss_calib = F.binary_cross_entropy_with_logits(
+            r_final_sq, y, pos_weight=pos_weight.expand_as(y), reduction="mean"
+        )
+
+        if "aux_outputs" in stage1_outputs:
+            for aux_out in stage1_outputs["aux_outputs"]:
+                if "pred_calib_logits" in aux_out:
+                    r_aux = aux_out["pred_calib_logits"].squeeze(-1)
+                    loss_calib += F.binary_cross_entropy_with_logits(
+                        r_aux, y, pos_weight=pos_weight.expand_as(y), reduction="mean"
+                    )
+
+        return {"loss_calib": loss_calib}
+
     def get_loss(
         self, loss, outputs, clip_targets, frame_targets, clip_indices, frame_indices, num_masks
     ):
@@ -265,9 +456,12 @@ class AvismSetCriterion(nn.Module):
             'avism_labels': self.loss_labels,
             'avism_masks': self.loss_masks,
             'fg_sim': self.loss_fg_sim,
+            'agcl_frame': self.loss_frame_contrastive,
+            'agcl_instance': self.loss_instance_contrastive,
+            'calib': self.loss_calibration,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
-        if loss == 'fg_sim':
+        if loss in ('fg_sim', 'agcl_frame', 'agcl_instance', 'calib'):
             return loss_map[loss](
                 outputs, clip_targets, frame_targets, clip_indices, frame_indices, num_masks
             )
@@ -286,7 +480,7 @@ class AvismSetCriterion(nn.Module):
         clip_indices = self.matcher(outputs_without_aux, clip_targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_masks = sum(len(t["labels"]) for t in clip_targets) * len(outputs_without_aux["pred_masks"])
+        num_masks = sum(len(t["labels"]) for t in clip_targets) * outputs_without_aux["pred_logits"].shape[0]
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
         )
@@ -308,7 +502,8 @@ class AvismSetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 clip_indices = self.matcher(aux_outputs, clip_targets)
                 for loss in self.losses:
-                    if loss == "fg_sim":
+                    # fg_sim, agcl_frame, agcl_instance, calib only computed on the final layer
+                    if loss in ("fg_sim", "agcl_frame", "agcl_instance", "calib"):
                         continue
                     l_dict = self.get_loss(
                         loss, aux_outputs, clip_targets, frame_targets, clip_indices, frame_indices, num_masks
