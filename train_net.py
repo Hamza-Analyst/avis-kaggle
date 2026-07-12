@@ -195,7 +195,7 @@ class Trainer(DefaultTrainer):
         assert torch.cuda.is_available(), "[SimpleTrainer] CUDA is required for the trainer!"
         
         from detectron2.utils.events import get_event_storage
-        from torch.cuda.amp import autocast
+        from torch.amp import autocast
         import time
 
         start = time.perf_counter()
@@ -229,7 +229,7 @@ class Trainer(DefaultTrainer):
             data_time = time.perf_counter() - start
 
             # Run forward pass with autocast
-            with autocast(enabled=self.grad_scaler.is_enabled()):
+            with autocast('cuda', enabled=self.grad_scaler.is_enabled()):
                 loss_dict = self.model(data)
 
             if isinstance(loss_dict, torch.Tensor):
@@ -292,7 +292,7 @@ class Trainer(DefaultTrainer):
         weights to evaluate.
         """
         if cfg["eval_only"]:
-            from torch.cuda.amp import autocast
+            from torch.amp import autocast
             logger = logging.getLogger(__name__)
             if isinstance(evaluators, DatasetEvaluator):
                 evaluators = [evaluators]
@@ -316,7 +316,7 @@ class Trainer(DefaultTrainer):
                         )
                         results[dataset_name] = {}
                         continue
-                with autocast():
+                with autocast('cuda'):
                     results_i = inference_on_dataset(model, data_loader, evaluator)
                 results[dataset_name] = results_i
 
