@@ -425,23 +425,40 @@ def main(args):
     if comm.is_main_process():
         results_file = os.path.join(cfg.OUTPUT_DIR, "eval_results.txt")
         logger.info(f"Saving evaluation results to {results_file}...")
-        with open(results_file, "w") as f:
-            f.write("=== AVISM Final Evaluation Results ===\n")
-            
-            # Unnest results if wrapped under the dataset name key
-            flat_res = res
-            if isinstance(res, dict) and len(res) == 1:
-                key = next(iter(res.keys()))
-                if key in cfg.DATASETS.TEST:
-                    flat_res = res[key]
+        
+        # Helper to format results
+        def write_results_to_file(path):
+            with open(path, "w") as f:
+                f.write("=== AVISM Final Evaluation Results ===\n")
+                flat_res = res
+                if isinstance(res, dict) and len(res) == 1:
+                    key = next(iter(res.keys()))
+                    if key in cfg.DATASETS.TEST:
+                        flat_res = res[key]
 
-            if isinstance(flat_res, dict) and "segm" in flat_res:
-                segm = flat_res["segm"]
-                for metric, val in segm.items():
-                    f.write(f"{metric}: {val}\n")
-            else:
-                f.write(str(res))
+                if isinstance(flat_res, dict) and "segm" in flat_res:
+                    segm = flat_res["segm"]
+                    for metric, val in segm.items():
+                        f.write(f"{metric}: {val}\n")
+                else:
+                    f.write(str(res))
+
+        write_results_to_file(results_file)
         print(f"Results saved to {results_file}")
+
+        # Kaggle integration: copy weights and results to /kaggle/working
+        if os.path.exists("/kaggle/working"):
+            import shutil
+            # Copy weights
+            src_weights = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+            dst_weights = "/kaggle/working/model_final.pth"
+            if os.path.exists(src_weights):
+                shutil.copy(src_weights, dst_weights)
+                logger.info(f"Kaggle: Copied weights to {dst_weights}")
+            # Save results
+            kaggle_results_file = "/kaggle/working/results.txt"
+            write_results_to_file(kaggle_results_file)
+            logger.info(f"Kaggle: Saved results to {kaggle_results_file}")
 
     return train_res
 
