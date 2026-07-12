@@ -417,10 +417,8 @@ class Avism_COCO(nn.Module):
         frame_query = frame_query.permute(1, 2, 0, 3).contiguous()
         frame_query = self.input_proj_dec(frame_query)  # T, fQ, LB, C
 
-        audio_feat = self.av_proj(audio_features)  # B*T, C
-        audio_feat = audio_feat.view(B, T, -1).permute(1, 0, 2)  # T, B, C
-        audio_feat = audio_feat[:, None, None, :, :].repeat(1, fQ, L, 1, 1)  # T, fQ, L, B, C
-        audio_feat = audio_feat.reshape(T, fQ, L * B, -1)  # T, fQ, LB, C
+        audio_feat = self.av_proj(audio_features)  # T, C
+        audio_feat = audio_feat[:, None, None, :].repeat(1, fQ, L * B, 1)
 
         if self.window_size > 0:
             pad = int(ceil(T / self.window_size)) * self.window_size - T

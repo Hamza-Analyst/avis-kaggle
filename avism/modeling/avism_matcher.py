@@ -96,12 +96,7 @@ class AvismHungarianMatcher(nn.Module):
 
         # Here, "L" is the number of frame-level decoder layers.
         out_prob = outputs["pred_logits"].softmax(-1)   # L, B, cQ, K+1
-        if "pred_masks" in outputs:
-            out_mask = outputs["pred_masks"]
-        elif "mask_features" in outputs:
-            out_mask = torch.einsum("lbqc,btchw->lbqthw", outputs["pred_mask_embed"], outputs["mask_features"])
-        else:
-            raise KeyError("Neither pred_masks nor mask_features found in outputs")
+        out_mask = outputs["pred_masks"]                # L, B, cQ, T, H, W
 
         L, B, cQ, T, s_h, s_w = out_mask.shape
 

@@ -9,6 +9,7 @@ import copy
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
 
+
 class SelfAttentionLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dropout=0.0,
@@ -228,8 +229,6 @@ class Avism(nn.Module):
             mask_dim: int,
             sim_use_clip: list,
             use_sim: bool,
-            num_registers: int,
-            audio_dim: int = 128,
     ):
         """
         NOTE: this interface is experimental.
@@ -263,13 +262,7 @@ class Avism(nn.Module):
         self.use_sim = use_sim
         self.aux_loss = aux_loss
 
-        self.av_proj = nn.Linear(audio_dim, hidden_dim)
-
-        # Registry tokens (attention sinks) for VL-AVFM
-        self.num_registers = num_registers
-        if num_registers > 0:
-            self.register_tokens = nn.Embedding(num_registers, hidden_dim)
-            nn.init.normal_(self.register_tokens.weight, std=0.02)
+        self.av_proj = nn.Linear(128, hidden_dim)
 
         self.enc_layers = enc_layers
         if enc_layers > 0:
@@ -401,8 +394,6 @@ class Avism(nn.Module):
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["sim_use_clip"] = cfg.MODEL.AVISM.SIM_USE_CLIP
         ret["use_sim"] = cfg.MODEL.AVISM.SIM_WEIGHT > 0.0
-        ret["num_registers"] = cfg.MODEL.AVISM.NUM_REGISTERS
-        ret["audio_dim"] = cfg.MODEL.AVISM.AUDIO_DIM
 
         return ret
 
@@ -426,10 +417,8 @@ class Avism(nn.Module):
         frame_query = frame_query.permute(1, 2, 0, 3).contiguous()
         frame_query = self.input_proj_dec(frame_query)  # T, fQ, LB, C
 
-        audio_feat = self.av_proj(audio_features)  # B*T, C
-        audio_feat = audio_feat.view(B, T, -1).permute(1, 0, 2)  # T, B, C
-        audio_feat = audio_feat[:, None, None, :, :].repeat(1, fQ, L, 1, 1)  # T, fQ, L, B, C
-        audio_feat = audio_feat.reshape(T, fQ, L * B, -1)  # T, fQ, LB, C
+        audio_feat = self.av_proj(audio_features)  # T, C
+        audio_feat = audio_feat[:, None, None, :].repeat(1, fQ, L * B, 1)
 
         if self.window_size > 0:
             pad = int(ceil(T / self.window_size)) * self.window_size - T
@@ -604,20 +593,11 @@ class Avism(nn.Module):
         # Not using window-based attention if self.window_size == 0.
         if self.window_size == 0:
             return_shape = frame_query.shape  # T, fQ, LB, C
-            frame_query_flat = frame_query.flatten(0, 1)  # TfQ, LB, C
+            frame_query = frame_query.flatten(0, 1)  # TfQ, LB, C
             audio_feats = audio_feats.flatten(0, 1)
 
-            # Concat register tokens to frame_query KV side
-            if self.num_registers > 0:
-                T_fq, LB, C = frame_query_flat.shape
-                regs = self.register_tokens.weight  # [R, C]
-                regs = regs[:, None, :].expand(-1, LB, -1)  # [R, LB, C]
-                kv = torch.cat([frame_query_flat, regs], dim=0)  # [TfQ+R, LB, C]
-            else:
-                kv = frame_query_flat
-
             for i in range(self.enc_layers):
-                audio_feats = self.enc_av_cross_attn[i](audio_feats, kv)
+                audio_feats = self.enc_av_cross_attn[i](audio_feats, frame_query)
                 audio_feats = self.enc_av_ffn[i](audio_feats)
 
             audio_feats = audio_feats.view(return_shape)
@@ -660,23 +640,7 @@ class Avism(nn.Module):
         audio_feats = audio_feats.view(Nw, W, fQ, LB, C)
         audio_feats = audio_feats.permute(1, 2, 3, 0, 4).reshape(W * fQ, LB * Nw, C)
 
-        # Concat register tokens to KV side (frame_query)
-        if self.num_registers > 0:
-            R = self.num_registers
-            regs = self.register_tokens.weight  # [R, C]
-            regs = regs[:, None, :].expand(-1, LB * Nw, -1)  # [R, LB*Nw, C]
-            kv = torch.cat([frame_query, regs], dim=0)  # [W*fQ+R, LB*Nw, C]
-            # Extend attention mask: registers are never masked
-            if attn_mask is not None:
-                reg_mask = torch.zeros(LB * Nw, R, device=attn_mask.device, dtype=attn_mask.dtype)
-                extended_mask = torch.cat([attn_mask, reg_mask], dim=1)
-            else:
-                extended_mask = None
-        else:
-            kv = frame_query
-            extended_mask = attn_mask
-
-        audio_feats = self.enc_av_cross_attn[layer_idx](audio_feats, kv, memory_key_padding_mask=extended_mask)
+        audio_feats = self.enc_av_cross_attn[layer_idx](audio_feats, frame_query, memory_key_padding_mask=attn_mask)
         audio_feats = self.enc_av_ffn[layer_idx](audio_feats)
 
         frame_query = frame_query.reshape(W, fQ, LB, Nw, C).permute(3, 0, 1, 2, 4).reshape(T, fQ, LB, C)
@@ -699,30 +663,7 @@ class Avism(nn.Module):
         audio_feats = audio_feats.view(Nw, W, fQ, LB, C)
         audio_feats = audio_feats.permute(1, 2, 3, 0, 4).reshape(W * fQ, LB * Nw, C)
 
-        # Concat register tokens to KV side
-        if self.num_registers > 0:
-            R = self.num_registers
-            regs = self.register_tokens.weight  # [R, C]
-            regs = regs[:, None, :].expand(-1, LB * Nw, -1)  # [R, LB*Nw, C]
-            kv = torch.cat([frame_query, regs], dim=0)  # [W*fQ+R, LB*Nw, C]
-            # For shift-window: attn_mask is [LB*Nw*H, W*fQ, W*fQ]
-            # We need to extend the key dimension by R
-            if attn_mask is not None:
-                # attn_mask shape: [LB*Nw*H, W*fQ, W*fQ] → extend last dim
-                N_heads = attn_mask.shape[0] // (LB * Nw)
-                # Registers should never be masked (allow attention)
-                reg_ext = torch.zeros(
-                    attn_mask.shape[0], attn_mask.shape[1], R,
-                    device=attn_mask.device, dtype=attn_mask.dtype
-                )
-                extended_mask = torch.cat([attn_mask, reg_ext], dim=2)
-            else:
-                extended_mask = None
-        else:
-            kv = frame_query
-            extended_mask = attn_mask
-
-        audio_feats = self.enc_av_cross_attn[layer_idx](audio_feats, kv, memory_mask=extended_mask)
+        audio_feats = self.enc_av_cross_attn[layer_idx](audio_feats, frame_query, memory_mask=attn_mask)
         audio_feats = self.enc_av_ffn[layer_idx](audio_feats)
 
         frame_query = frame_query.reshape(W, fQ, LB, Nw, C).permute(3, 0, 1, 2, 4).reshape(T, fQ, LB, C)

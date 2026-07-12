@@ -284,9 +284,9 @@ class AVISM_COCO(nn.Module):
         losses, fg_indices = self.criterion(outputs, frame_targets)
 
         avism_outputs = self.vita_module(frame_queries, audio_features)
-        avism_outputs["mask_features"] = mask_features
+        avism_outputs["pred_masks"] = torch.einsum("lbqc,btchw->lbqthw", avism_outputs["pred_mask_embed"], mask_features)
         for out in avism_outputs["aux_outputs"]:
-            out["mask_features"] = mask_features
+            out["pred_masks"] = torch.einsum("lbqc,btchw->lbqthw", out["pred_mask_embed"], mask_features)
 
         for k in list(losses.keys()):
             if k in self.criterion.weight_dict:
